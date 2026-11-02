@@ -1,0 +1,4 @@
+PyMuPDF==1.26.7
+Pillow==12.3.0
+openpyxl==3.1.5
+PyInstaller==6.22.3
