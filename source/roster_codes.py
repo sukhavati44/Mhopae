@@ -44,7 +44,7 @@ def validate_students(students):
             raise ValueError(f'{where}: 비어 있는 코드는 빈 문자열이어야 합니다.')
 
 
-def read_students(path, sheet=None, code_column=None):
+def read_students(path, sheet=None, code_column=None, allow_partial=False):
     book = load_workbook(path, read_only=True, data_only=False)
     try:
         ws = book[sheet] if sheet else book[book.sheetnames[0]]
@@ -52,7 +52,7 @@ def read_students(path, sheet=None, code_column=None):
         match = None
         for i, row in enumerate(rows[:3]):
             headers = [str(c.value or '').strip() for c in row]
-            if all(any(alias in headers for alias in ALIASES[k]) for k in ('class','number','name')):
+            if (all(any(alias in headers for alias in ALIASES[k]) for k in ('class','number','name')) or (allow_partial and any(alias in headers for alias in ALIASES['code']))):
                 match = (i, headers)
                 break
         if match is None:
@@ -65,7 +65,7 @@ def read_students(path, sheet=None, code_column=None):
             found = [j for j, h in enumerate(headers) if h in aliases]
             if len(found) > 1:
                 raise ValueError(f'{field}에 해당하는 열이 중복됩니다. 사용할 열을 확인하십시오.')
-            if not found and (field != 'code' or code_column):
+            if not found and (field != 'code' or code_column) and not (allow_partial and field!='code'):
                 raise ValueError('지정한 열을 찾지 못했습니다. 열 이름을 확인하십시오.')
             columns[field] = found[0] if found else None
         students = []
@@ -92,7 +92,21 @@ def read_students(path, sheet=None, code_column=None):
                         text = str(value).zfill(len(cell.number_format))
                     student[field] = text
             students.append(student)
-        validate_students(students)
+        if allow_partial:
+            if not students:raise ValueError('학생 행이 없는 명단입니다.')
+            codes=set();seats=set()
+            for student in students:
+                code=student['code']
+                if code:
+                    validate_ids([code],1)
+                    if code.casefold() in codes:raise ValueError('학생 간 코드 중복: 원본 코드표를 확인하십시오.')
+                    codes.add(code.casefold())
+                if student['number'] and (not student['number'].isdigit() or int(student['number'])<1):raise ValueError('번호 형식을 확인하십시오.')
+                if student['class'] and student['number']:
+                    seat=(student['class'],int(student['number']))
+                    if seat in seats:raise ValueError('같은 학급·번호 중복: 원본 코드표를 확인하십시오.')
+                    seats.add(seat)
+        else:validate_students(students)
         return students
     finally:
         book.close()

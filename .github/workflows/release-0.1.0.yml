@@ -1,0 +1,40 @@
+name: Release MHopae 0.1.0
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release-0.1.0.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: mhopae-release-0.1.0
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install pinned build dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify source and synthetic export
+        run: python scripts/release_smoke.py
+      - name: Build portable onedir
+        run: python -m PyInstaller --noconfirm --distpath dist --workpath build MHopae.spec
+      - name: Package and verify
+        run: python scripts/package_release.py
+      - name: Publish versioned release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v0.1.0 --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'v0.1.0 already exists; refusing to replace it' }
+          gh release create v0.1.0 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title '무명호패 0.1.0' --notes-file docs/releases/v0.1.0.md --latest release/MHopae-0.1.0-windows-x64.zip release/SHA256SUMS.txt release/build-manifest.json
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

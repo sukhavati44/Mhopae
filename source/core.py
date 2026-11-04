@@ -13,6 +13,8 @@ import unicodedata
 sys.path.insert(0, str(Path(__file__).parent / 'vendor'))
 import pymupdf as fitz
 from openpyxl import load_workbook
+from page_rules import white_pixels
+from dataclasses import asdict
 
 RESERVED = {'CON', 'PRN', 'AUX', 'NUL'} | {f'{s}{i}' for s in ('COM', 'LPT') for i in range(1, 10)}
 
@@ -71,8 +73,8 @@ def read_roster(path, sheet, id_column):
 def check_cut(cut, dpi):
     if not isinstance(cut, (int, float)) or not math.isfinite(cut) or not 0 <= cut < 1:
         raise ValueError('절단선은 0% 이상 100% 미만이어야 합니다.')
-    if dpi not in (150, 200, 300):
-        raise ValueError('DPI는 150, 200, 300 중 선택하십시오.')
+    if dpi not in (150, 200, 300, 400):
+        raise ValueError('DPI는 300 또는 400을 선택하십시오.')
 
 def render_bottom(page, cut, dpi):
     check_cut(cut, dpi)
@@ -85,12 +87,22 @@ def render_bottom(page, cut, dpi):
     # annots=False also excludes rendered annotations, including below the cut.
     return page.get_pixmap(dpi=dpi, clip=clip, colorspace=fitz.csRGB, alpha=False, annots=False)
 
-def make_pdf(page, ident, cut, dpi):
+def make_pdf(page, ident, cut, dpi, masks=(), metadata=None):
     pix = render_bottom(page, cut, dpi)
     doc = fitz.open()
     try:
         width, height = pix.width * 72 / dpi, pix.height * 72 / dpi
         # Built-in embedded Unicode font: portable, no Windows font dependency.
+        if metadata is not None:
+            from page_identity import validate, box_header, draw_header, write
+            metadata=validate(metadata)
+            if metadata['student_code']!=ident:raise ValueError('표시 코드와 페이지 정보 코드가 다릅니다.')
+            layout=box_header(doc,width,metadata);header=layout['height']
+            out=doc.new_page(width=width,height=height+header)
+            draw_header(out,layout)
+            out.insert_image(fitz.Rect(0,header,width,height+header),stream=_masked_png(pix,page.rect,masks,dpi))
+            write(out,metadata);doc.set_metadata({});doc.subset_fonts()
+            return doc.tobytes(garbage=4,deflate=True)
         font = fitz.Font('cjk')
         if any(not font.has_glyph(ord(char)) for char in ident):
             raise ValueError('내장 글꼴로 표시할 수 없는 ID 문자가 있습니다. 원본 ID는 변경하지 않습니다.')
@@ -112,12 +124,18 @@ def make_pdf(page, ident, cut, dpi):
         out.insert_font(fontname='idfont', fontbuffer=font.buffer)
         for i, line in enumerate(lines):
             out.insert_text((12, 24 + i * 24), line, fontsize=font_size, fontname='idfont', color=(0, 0, 0))
-        out.insert_image(fitz.Rect(0, header, width, height + header), stream=pix.tobytes('png'))
+        out.insert_image(fitz.Rect(0, header, width, height + header), stream=_masked_png(pix,page.rect,masks,dpi))
         doc.set_metadata({})
         doc.subset_fonts()
         return doc.tobytes(garbage=4, deflate=True)
     finally:
         doc.close()
+
+def _masked_png(pix, rect, masks, dpi):
+    if not masks:return pix.tobytes('png')
+    im=white_pixels(pix,rect,masks,dpi)
+    stream=io.BytesIO();im.save(stream,format='PNG');return stream.getvalue()
+
 
 def plan_names(ids, folder):
     folder = Path(folder)
@@ -146,7 +164,7 @@ def roster_sheets(path):
     finally:
         book.close()
 
-def export_batch(source, ids, folder, cut, dpi=300, allow_collisions=False, roster=None, progress=None, reverse=False):
+def export_batch(source, ids, folder, cut, dpi=300, allow_collisions=False, roster=None, progress=None, reverse=False, rules=None, page_metadata=None):
     source, folder = Path(source).resolve(), Path(folder).resolve()
     check_cut(cut, dpi)
     if not folder.is_dir():
@@ -173,13 +191,18 @@ def export_batch(source, ids, folder, cut, dpi=300, allow_collisions=False, rost
             for i, (ident, path) in enumerate(zip(ids, paths)):
                 status = 'ok'
                 try:
-                    data = make_pdf(src[source_page(i, src.page_count, reverse)], ident, cut, dpi)
+                    page_index=source_page(i, src.page_count, reverse)
+                    page_cut,masks=rules.for_page(page_index) if rules else (cut,())
+                    data = make_pdf(src[page_index], ident, page_cut, dpi, masks, page_metadata[i] if page_metadata is not None else None)
                     # Exclusive creation protects against races after name planning.
                     with path.open('xb') as f:
                         f.write(data)
                     with fitz.open(path) as check:
-                        if check.page_count != 1 or ''.join(check[0].get_text().splitlines()) != ident:
-                            raise RuntimeError('출력 재열람 검증 실패')
+                        if check.page_count != 1:raise RuntimeError('출력 페이지 수 검증 실패')
+                        if page_metadata is not None:
+                            from page_identity import read
+                            if read(check[0])!=page_metadata[i]:raise RuntimeError('페이지 정보 재열람 검증 실패')
+                        elif ''.join(check[0].get_text().splitlines()) != ident:raise RuntimeError('출력 재열람 검증 실패')
                 except Exception as exc:
                     status = f'failed:{type(exc).__name__}'
                 writer.writerow([run, source.name, source_page(i, src.page_count, reverse) + 1, ident, path.name, cut, dpi, status])
@@ -193,11 +216,11 @@ def export_batch(source, ids, folder, cut, dpi=300, allow_collisions=False, rost
     with (folder / f'run_{run}_hashes.json').open('x', encoding='utf-8') as f:
         json.dump({'source_pdf_sha256': hashes[str(source)],
                    'roster_sha256': hashes.get(str(Path(roster).resolve())) if roster else None,
-                   'inputs_unchanged': unchanged}, f, indent=2)
+                   'inputs_unchanged': unchanged, 'page_rules':asdict(rules) if rules else None}, f, indent=2)
     return results, log, hashes
 
 
-def export_bundle(source, ids, folder, cut, dpi=300, allow_collisions=False, roster=None, progress=None, reverse=False):
+def export_bundle(source, ids, folder, cut, dpi=300, allow_collisions=False, roster=None, progress=None, reverse=False, rules=None, page_metadata=None):
     """Combine only newly rasterized, anonymized pages, never original objects."""
     source, folder = Path(source).resolve(), Path(folder).resolve()
     check_cut(cut, dpi)
@@ -228,9 +251,14 @@ def export_bundle(source, ids, folder, cut, dpi=300, allow_collisions=False, ros
             try:
                 with fitz.open() as combined:
                     for i, ident in enumerate(ids):
-                        data = make_pdf(src[source_page(i, src.page_count, reverse)], ident, cut, dpi)
+                        page_index=source_page(i, src.page_count, reverse)
+                        page_cut,masks=rules.for_page(page_index) if rules else (cut,())
+                        data = make_pdf(src[page_index], ident, page_cut, dpi, masks, page_metadata[i] if page_metadata is not None else None)
                         with fitz.open(stream=data, filetype='pdf') as single:
                             combined.insert_pdf(single)
+                            if page_metadata is not None:
+                                from page_identity import write
+                                write(combined[-1],page_metadata[i])
                         if progress:
                             progress(i + 1, src.page_count)
                     combined.set_metadata({})
@@ -238,8 +266,8 @@ def export_bundle(source, ids, folder, cut, dpi=300, allow_collisions=False, ros
                 # Validate all pages before creating the single output file.
                 with fitz.open(stream=data, filetype='pdf') as check:
                     if check.page_count != len(ids) or any(
-                            ''.join(page.get_text().splitlines()) != ident
-                            for page, ident in zip(check, ids)):
+                            (not metadata_matches(page,page_metadata[i])) if page_metadata is not None else ''.join(page.get_text().splitlines()) != ident
+                            for i,(page, ident) in enumerate(zip(check, ids))):
                         raise RuntimeError('묶음 출력 검증 실패')
                 if not all(digest(p) == h for p, h in hashes.items()):
                     raise RuntimeError('입력 파일이 변경되었습니다.')
@@ -247,8 +275,8 @@ def export_bundle(source, ids, folder, cut, dpi=300, allow_collisions=False, ros
                     target.write(data)
                 with fitz.open(path) as check:
                     if check.page_count != len(ids) or any(
-                            ''.join(page.get_text().splitlines()) != ident
-                            for page, ident in zip(check, ids)):
+                            (not metadata_matches(page,page_metadata[i])) if page_metadata is not None else ''.join(page.get_text().splitlines()) != ident
+                            for i,(page, ident) in enumerate(zip(check, ids))):
                         raise RuntimeError('묶음 출력 재열람 검증 실패')
             except Exception as exc:
                 # A bundle is one result: never report a partial document as success.
@@ -265,5 +293,10 @@ def export_bundle(source, ids, folder, cut, dpi=300, allow_collisions=False, ros
     with (folder / f'run_{run}_hashes.json').open('x', encoding='utf-8') as f:
         json.dump({'source_pdf_sha256': hashes[str(source)],
                    'roster_sha256': hashes.get(str(Path(roster).resolve())) if roster else None,
-                   'inputs_unchanged': unchanged, 'output_mode': 'bundle'}, f, indent=2)
+                   'inputs_unchanged': unchanged, 'page_rules':asdict(rules) if rules else None, 'output_mode': 'bundle'}, f, indent=2)
     return results, log, hashes
+
+
+def metadata_matches(page, expected):
+    from page_identity import read
+    return read(page)==expected

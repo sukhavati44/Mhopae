@@ -9,7 +9,14 @@ from core import fitz, digest, read_roster_details, validate_ids, make_pdf, plan
 from file_drop import FileDrop
 from roster_codes import read_students, issue_missing, save_code_table
 
-class App:
+from editor_ui import EditorUI
+from page_rules import PageRules
+from dpi_info import detect_dpi
+from page_identity import identity as page_identity
+from batch_ui import BatchDialog,regroup_dialog
+from visual_guide import ButtonGuide, main_button
+
+class App(EditorUI):
     def __init__(self, root):
         self.root = root
         # Use bundled Tk's message box placement on the owning window.
@@ -19,8 +26,9 @@ class App:
         locale=str(root.tk.call('::msgcat::mclocale'))
         for original,translated in (('&Yes','예'),('&No','아니요'),('&OK','확인'),('&Cancel','취소'),('&Retry','다시 시도'),('&Abort','중단'),('&Ignore','무시')):
             root.tk.call('::msgcat::mcset',locale,original,translated)
+        root.protocol('WM_DELETE_WINDOW',self.close_app)
         self.configure_style()
-        root.title('무명호패 Beta 0.0.1 — PDF 비식별화 도구')
+        root.title('무명호패 v0.1.0 — PDF 비식별화 도구')
         root.geometry('1380x940')
         root.minsize(1080,760)
         self.pdf = self.roster = None
@@ -51,13 +59,16 @@ class App:
             self.buttons.append(widget)
             return widget
         header = ttk.Frame(root, padding=(12,8));header.pack(fill='x')
-        ttk.Label(header,text='무명호패 Beta 0.0.1',font=('맑은 고딕',14,'bold')).pack(side='left')
+        ttk.Label(header,text='무명호패 v0.1.0',font=('맑은 고딕',14,'bold')).pack(side='left')
         ttk.Label(header,text='  PDF 비식별화 도구  |  오프라인',style='Muted.TLabel').pack(side='left')
         button(header,'reset','새 작업',self.reset).pack(side='right')
+        button(header,'merge','학생별 PDF 병합',self.merge_dialog).pack(side='right',padx=8)
         files = ttk.Frame(root,padding=(12,0,12,6));files.pack(fill='x')
         button(files,'load_roster','명단 XLSX 열기',self.load_xlsx).pack(side='left',padx=(0,6))
         button(files,'load_pdf','원본 PDF 열기',self.load_pdf).pack(side='left')
-        ttk.Label(files,text='  PDF·XLSX를 창에 끌어 놓아도 됩니다.').pack(side='left')
+        ttk.Label(files,text='  PDF·XLSX 끌어 놓기').pack(side='left')
+        button(files,'batch_scan','대량 스캔 대응·출력',lambda:BatchDialog(self)).pack(side='right',padx=5)
+        button(files,'regroup','정보로 묶기·나누기',lambda:regroup_dialog(self)).pack(side='right')
         self.file_status=tk.StringVar(value='명단과 PDF를 불러오십시오.')
         self.file_label=ttk.Label(root,textvariable=self.file_status,style='Muted.TLabel',padding=(12,0,12,6),wraplength=1100)
         self.file_label.pack(fill='x')
@@ -129,19 +140,29 @@ class App:
         self.page_info=tk.StringVar(value='PDF를 불러오면 원본이 표시됩니다.')
         ttk.Label(nav,textvariable=self.page_info).pack(side='left',padx=8)
         settings=ttk.Frame(right,padding=(8,5));settings.pack(fill='x')
-        ttk.Label(settings,text='출력 해상도').pack(side='left')
+        ttk.Label(settings,text='DPI 선택').pack(side='left')
         self.dpi=tk.StringVar(value='300')
-        self.dpi_combo=ttk.Combobox(settings,textvariable=self.dpi,values=['150','200','300'],state='readonly',width=5)
+        self.dpi_combo=ttk.Combobox(settings,textvariable=self.dpi,values=['300','400'],state='readonly',width=5)
         self.dpi_combo.pack(side='left',padx=(4,10))
         self.dpi.trace_add('write',lambda *_:self.settings_changed())
         self.direction=tk.StringVar(value='원래 순서')
         self.direction_combo=ttk.Combobox(settings,textvariable=self.direction,values=['원래 순서','전체 페이지 역순'],state='readonly',width=18)
         self.direction_combo.pack(side='left')
         self.direction.trace_add('write',lambda *_:self.mapping_changed())
+        self.page_order=tk.StringVar(value='1')
+        ttk.Label(settings,text='페이지순번').pack(side='left',padx=(8,0))
+        self.page_order_spin=ttk.Spinbox(settings,from_=1,to=9999,textvariable=self.page_order,width=5);self.page_order_spin.pack(side='left',padx=4)
+        self.page_order.trace_add('write',lambda *_:self.settings_changed())
         button(settings,'zero','절단선 0%로',self.zero).pack(side='right')
+        self.init_editor(right)
         self.canvas=tk.Canvas(right,bg='#E9EDF2',width=780,height=650,highlightthickness=0)
         self.canvas.pack(fill='both',expand=True,padx=(8,0))
         self.canvas.bind('<Button-1>',self.click)
+        self.canvas.bind('<B1-Motion>',self.drag)
+        self.canvas.bind('<ButtonRelease-1>',self.release)
+        scroll=ttk.Scrollbar(right,orient='horizontal',command=self.canvas.xview);scroll.pack(fill='x')
+        self.canvas.configure(xscrollcommand=scroll.set)
+        self.canvas.bind('<MouseWheel>',lambda e:self.canvas.yview_scroll(-1 if e.delta>0 else 1,'units'))
         self.canvas.bind('<Configure>',lambda e:self.show_page())
         pdf_hint=ttk.Label(right,text='원본을 클릭해 절단선을 정합니다. 선 위를 제거하며, 본문 개인정보는 자동 판독하지 않습니다.',wraplength=780)
         pdf_hint.pack(fill='x',padx=8,pady=4)
@@ -171,6 +192,7 @@ class App:
         self.controls['save_table'].configure(style='Secondary.TButton')
         self.update_counts()
         self.file_drop=FileDrop(root,self.handle_drop)
+        self.visual_guide=ButtonGuide(root,lambda:main_button(self))
 
     def configure_style(self):
         # Presentation only: keep the approved layout, commands and data flow.
@@ -300,7 +322,7 @@ class App:
         sheet,column=options
         def load():
             students = read_students(path, sheet, column or None)
-            self.students, self.roster, self.selected = students, path, []
+            self.students, self.roster, self.selected = students, path, [];self.roster_options=options
             self.excluded_ids.clear()
             self.candidate_order=list(range(len(students)));self.candidate_excluded.clear();self.show_excluded_candidates.set(False)
             self.code_dirty = False
@@ -433,7 +455,9 @@ class App:
                 if doc.needs_pass or not doc.is_pdf or not doc.page_count:raise ValueError('읽을 수 있는 비암호화 PDF가 필요합니다.')
                 self.count = doc.page_count
             self.invalidate_previews()
-            self.pdf = path; self.pdf_hash = digest(path); self.page.set(1); self.spin.configure(to=self.count); self.refresh(); self.show_page()
+            self.pdf = path; self.pdf_hash = digest(path); self.rules=PageRules(.18);self.cut=.18;self.mask_selection=None;self.drag_state=None
+            info=detect_dpi(path);self.dpi.set(str(info['selected']));self.dpi_info.set(info['reason']+' · 출력 DPI를 높여도 원본 필기 정보가 추가되지는 않습니다.')
+            self.page.set(1); self.spin.configure(to=self.count); self.refresh(); self.show_page()
             return True
         return self.guarded(load)
     def refresh(self):
@@ -507,8 +531,11 @@ class App:
             self.status.set('선택 학생의 상대 순서를 유지해 이동했습니다. 바뀐 페이지-학생 대응과 표본을 다시 확인하십시오.')
     def zero(self):
         if self.busy:return
-        self.cut=0; self.reviewed.clear();self.invalidate_previews();self.show_page();self.update_controls()
-    def show_page(self):
+        p=self.current_original()
+        if p in self.rules.cuts:self.rules.cuts[p]=0
+        else:self.rules.cut=0;self.cut=0
+        self.rules_changed()
+    def legacy_show_page(self):
         if not self.pdf:return
         self.update_counts()
         try:
@@ -526,7 +553,7 @@ class App:
             self.canvas.create_line(x,y+h*self.cut,x+w,y+h*self.cut,fill='red',width=3)
             self.page_info.set(f'처리 {n+1}/{self.count} · 원본 {original+1} · 절단 {self.cut:.2%}')
         except Exception as e:self.status.set(f'미리보기 오류: {type(e).__name__}')
-    def click(self,event):
+    def legacy_click(self,event):
         if self.busy:return
         if self.preview_rect:
             x,y,w,h=self.preview_rect
@@ -611,7 +638,9 @@ class App:
                 top.preview_next.configure(state='normal' if position+1<self.count else 'disabled')
                 try:
                     with fitz.open(self.pdf) as doc:
-                        data=make_pdf(doc[original],ident,self.cut,int(self.dpi.get()))
+                        page_cut,masks=self.rules.for_page(original)
+                        metadata=page_identity(ident,student['class'],int(self.page_order.get())) if student else None
+                        data=make_pdf(doc[original],ident,page_cut,int(self.dpi.get()),masks,metadata)
                     with fitz.open(stream=data,filetype='pdf') as doc:
                         pix=doc[0].get_pixmap();top.preview_image=Image.open(io.BytesIO(pix.tobytes('png'))).copy()
                     top.preview_identified=student is not None
@@ -634,7 +663,7 @@ class App:
                 raise ValueError('실제 처리 ID가 0개입니다. 명렬표 후보를 선택하고 「선택 → 포함」을 누른 뒤 아래 처리 순서를 확인하십시오.')
             validate_ids(self.selected,self.count)
             if 0 not in self.reviewed or (self.count>1 and not any(n>0 for n in self.reviewed)):
-                raise ValueError('현재 절단선으로 첫 페이지와 다른 표본 페이지의 결과를 확인하십시오.')
+                raise ValueError('현재 절단·마스킹 규칙으로 첫 페이지와 다른 표본 페이지의 결과를 확인하십시오.')
             folder=filedialog.askdirectory(title='입력과 분리된 로컬 출력 폴더 (동기화 폴더 금지)')
             if not folder:return
             bundle = self.output_mode.get() == 'bundle'
@@ -645,11 +674,13 @@ class App:
             self.output_folders.add(str(Path(folder).resolve()))
             args=(self.pdf,list(self.selected),folder,self.cut,int(self.dpi.get()),bool(collisions),self.roster)
             reverse=self.direction.get() == '전체 페이지 역순'
+            rule_snapshot=self.rules.snapshot()
+            page_metadata=[page_identity(code,next(s['class'] for s in self.students if s['code']==code),int(self.page_order.get())) for code in self.selected]
             self.set_busy(True)
             def worker():
                 try:
                     exporter = export_bundle if bundle else export_batch
-                    result,log,_=exporter(*args,reverse=reverse)
+                    result,log,_=exporter(*args,reverse=reverse,rules=rule_snapshot,page_metadata=page_metadata)
                     ok=sum(r[3]=='ok' for r in result)
                     detail='\n'.join(f'{r[0]}페이지 {r[1]} {r[3]}' for r in result if r[3]!='ok')
                     files = len({r[2] for r in result if r[3] == 'ok'})
@@ -660,8 +691,15 @@ class App:
             threading.Thread(target=worker,daemon=False).start()
         self.guarded(start)
 
+    def close_app(self):
+        if self.busy or any(review.busy for review in getattr(self,'page_reviews',[])):
+            self.notice('showinfo','저장 중','저장이 끝난 뒤 프로그램을 닫으십시오.');return
+        for dialog in getattr(self,'batch_dialogs',[]):
+            if dialog.top.winfo_exists() and not dialog.confirm_close():return
+        self.root.destroy()
+
     def review_token(self):
-        return (self.generation,self.pdf,tuple(self.selected),self.cut,self.dpi.get(),self.direction.get())
+        return (self.generation,self.pdf,tuple(self.selected),self.cut,self.dpi.get(),self.direction.get(),self.rules.token(),self.page_order.get())
 
     def invalidate_previews(self):
         self.generation += 1
@@ -691,6 +729,8 @@ class App:
         if self.code_dirty:warning+='\n주의: 아직 저장하지 않은 신규 코드는 초기화됩니다.'
         if not self.notice('askyesno','새 작업 / 초기화',warning,parent=self.root):return
         self.invalidate_previews()
+        self.rules=PageRules(.18);self.cut=.18;self.mask_selection=None;self.drag_state=None
+        self.exception_combo.configure(values=[]);self.exception_choice.set('')
         self.pdf=self.roster=None
         self.pdf_hash=self.roster_hash=None
         self.records=[];self.visible_records=[];self.selected=[];self.count=0;self.reviewed.clear()
@@ -703,7 +743,7 @@ class App:
         self.page_info.set('PDF를 불러오면 원본이 표시됩니다.')
         self.available.delete(0,'end');self.order.delete(0,'end');self.canvas.delete('all')
         self.page.set(1);self.spin.configure(to=1);self.dpi.set('300');self.direction.set('원래 순서')
-        self.output_mode.set('individual')
+        self.output_mode.set('individual');self.page_order.set('1')
         self.update_counts()
         self.status.set('새 작업: 로컬 XLSX와 PDF를 선택하십시오.')
 
